@@ -212,6 +212,60 @@ callback choosing the path. For AshResource there is no semantic-drift risk
 (unlike porting a vendor engine): *we* define the row's evaluation
 semantics, and the code already implements them.
 
+## Percentage rollouts under caching and streaming
+
+Rollouts are where per-actor answers, caching, and rule changes intersect, so
+the interaction deserves explicit statement.
+
+**Steady state: caching is transparent to rollouts.** Every backend buckets
+deterministically on `{flag_key, targeting_key}` — AshResource's
+`phash2({key, targeting_key}, 100) < pct`, Flipt hashing `entityId`
+server-side, LaunchDarkly hashing the context key — so a cached per-actor
+result is bit-identical to recomputation. Per-actor cache keys (built on the
+targeting key) preserve the distribution exactly; a 20% flag stays the same
+20% of users whether served from cache or provider. Context-attribute churn
+(a role change) moves an actor to a *new cache key* but not a new bucket —
+key churn is never decision churn. Anonymous traffic is all-or-nothing by
+constant key, cached the same way.
+
+**Raising a percentage is benign under any TTL.** All four bucketing schemes
+are threshold-based (`bucket < pct` for on/off), so 25% → 50% makes the "on"
+set a strict superset: during a TTL drift window, an actor is either already
+on (stays on) or comes on when their entry expires. Nobody flickers; late
+entries just arrive late. (Reweighting a *multivariate* flag is not monotone
+— users can switch variants during the drift window — one more reason the
+variant comparison is part of the cache key.)
+
+**Lowering a percentage is the sharp edge — and the core rollback argument
+for streaming.** 50% → 5% (or → 0) is how a bad rollout gets pulled, and a
+TTL cache keeps serving the feature to pulled-out users for up to one TTL.
+Change-driven invalidation turns that into: one event, every per-actor entry
+for the flag drops, everyone re-buckets against the new percentage nearly
+simultaneously — a consistent cutover instead of a decaying mix. (This burst
+is the measured invalidation stampede; percentage changes on hot flags are
+its canonical trigger, and ruleset-cached sources are immune — the row swaps
+once and every actor's next call re-buckets locally with no re-reads.)
+
+**Rollout changes are the canonical Hole 4 case.** A percentage change is
+invisible to the sentinel-context diff whenever the sentinel's own bucket
+sits inside both the old and new percentage (25% → 50% with the sentinel at
+bucket 7 changes nothing the poller can see per-flag). This is exactly why
+ETag-moved clears the whole source rather than trusting the diff.
+
+**Outage behaviour: demotion preserves the distribution; `on_error`
+collapses it.** During a stream/backend outage, demoted last-known-good
+entries keep each actor's prior bucket decision — a 50% rollout stays 50%.
+Falling to `on_error` instead would snap *every* rolled-out actor to the
+flag default at once (50% → 0% or → 100%), which for a rollout is not
+degraded service but a mass blip. The serve-stale ladder earns its keep most
+visibly here, and it is the strongest argument for pulling `on_error :stale`
+forward once the demotion window can expire mid-outage.
+
+**Stability caveat (documented, not new):** all of this rests on stable
+targeting keys — the `ash_authentication` subject, or the primary-key
+fallback. Deploys, cache clears, and reconciliations never re-bucket anyone
+because the bucket never lived in the cache; it lives in the hash.
+
 ## Does the existing code need restructuring?
 
 Reviewed with watchers in mind. The dispatcher/watcher layer is genuinely
