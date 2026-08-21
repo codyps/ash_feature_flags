@@ -85,13 +85,45 @@ started by `AshFeatureFlags.Application` for providers listed under a new
 because it opens sockets/timers). Each watcher reports `:up`/`:down`/
 `{:changed, keys}` to `Changes`.
 
-### 3. Cache semantics: `ttl :until_change`
+### 3. Cache semantics: `ttl {:until_change, fallback}`
 
-A new TTL value at every level (flag `ttl`, resource `cache_ttl`, app
-`cache_ttl`): entries are written without expiry **while the flag's provider
-has a healthy change stream**, and the evaluator falls back to the normal
-numeric TTL chain when the stream is `:down`. Health is tracked per *source
-id* (see the restructuring section) — the watcher registry is consulted at
+A new TTL form at every level (flag `ttl`, resource `cache_ttl`, app
+`cache_ttl`). The fallback is **part of the ttl option itself**, not a
+separate knob:
+
+```elixir
+flag :new_checkout do
+  ttl {:until_change, :timer.seconds(5)}
+end
+```
+
+Semantics: an entry is written without expiry when the flag's *source*
+(see the restructuring section) is affirmatively **vouched for** by a
+health-checked change stream at write time; otherwise the entry gets the
+fallback TTL. "Not vouched" deliberately covers every unverified state with
+one number: the stream is `:down`; the source's signal can never prove
+liveness (webhooks — Hole 3); the signal is not fully trusted (ETag pollers
+without `trust_etag` — Hole 4); or no watcher is configured at all. That last
+case is the degradation story: `{:until_change, 5_000}` with no watcher
+behaves exactly like `ttl 5_000` — misconfiguration fails safe into today's
+behaviour instead of into unbounded staleness (a boot-time log notice points
+it out).
+
+Keeping the fallback inside the option matters for resolution too: with a
+separate knob, a flag declaring `ttl :until_change` would have its degraded
+TTL configured at some *other* level of the flag → resource → app chain —
+spooky action, and unresolvable if that chain also says `:until_change`.
+As a tuple, both halves of the policy travel together through the one
+existing chain. A bare `:until_change` is still accepted and takes its
+fallback from the first *numeric* value further down the chain (else the
+5s default) — conservative, and webhook users who want long-lived entries
+are told to write the tuple explicitly. `{:until_change, 0}` expresses
+"cache only while vouched" — kill-switch semantics that still get the
+streaming upside. `{:until_change, :infinity}` is rejected: unbounded
+lifetime without vouching violates the invariant in the consistency
+section.
+
+Health is tracked per source id — the watcher registry is consulted at
 cache-write time, and on a `:down` transition the dispatcher calls
 `Cache.clear_source/1` for exactly that source, so nothing is pinned stale
 across an outage and no other backend's entries are touched. `error_ttl` and
@@ -99,7 +131,7 @@ the failures-not-cached rule are unchanged; `invalidate/1` keeps its public
 contract but routes through the dispatcher.
 
 This is the payoff piece: stream healthy → zero re-reads, instant changes;
-stream broken → today's behaviour, automatically.
+stream broken, missing, or untrusted → the fallback TTL, automatically.
 
 ## Does the existing code need restructuring?
 
@@ -280,9 +312,13 @@ stale survives the gap.
 A webhook that never arrives is indistinguishable from no change: the app was
 deploying, the LB dropped it, the HMAC secret rotated, Flipt's sink queue
 overflowed. There is no `:down` to observe. Consequence, stated as a hard
-rule: **webhook-fed sources never qualify for unbounded `:until_change`** —
-they resolve it to the configurable `max_staleness` bound (default ~10 min).
-Better: pair the webhook with the OFREP reconciliation poller against the same
+rule: **webhook-fed sources never vouch**, so under
+`ttl {:until_change, fallback}` their entries always carry the fallback TTL —
+the webhook just collapses staleness from "up to fallback" to "sub-second"
+whenever it does arrive. Set the fallback generously for these sources
+(`{:until_change, :timer.minutes(10)}`) since it is the safety net, not the
+primary mechanism. Better: pair the webhook with the OFREP reconciliation
+poller against the same
 backend — the webhook becomes a *latency optimization* (sub-second reaction)
 while the poller is the *correctness mechanism* (bounded, health-checked).
 Belt and suspenders, and each is simple alone.
@@ -299,10 +335,12 @@ sentinel's values untouched. Two consequences:
   actively-used flag+actor, not a stampede of wasted work.
 * Whether the ETag itself is computed over the *configuration* (catches
   everything) or over the *evaluated results* (same blind spot as the diff)
-  is server-dependent and mostly undocumented. So by default, poller-fed
-  `:until_change` is **also bounded by `max_staleness`**, liftable per source
-  (`trust_etag: true`) when the operator knows their server hashes config —
-  flagd and GO Feature Flag can be verified and documented case by case.
+  is server-dependent and mostly undocumented. So by default the poller
+  **does not vouch** — entries keep the `{:until_change, fallback}` fallback
+  TTL, and the poller merely shrinks typical staleness to its interval. A
+  source marked `trust_etag: true` (the operator knows their server hashes
+  config — flagd and GO Feature Flag can be verified and documented case by
+  case) vouches fully and unlocks the no-expiry path.
 
 ### Hole 5: cross-node divergence
 
@@ -312,8 +350,9 @@ pinned stale with no signal. Rule: **polling/streaming watchers run on every
 node** — each node's cache is guarded by its own watcher, and cross-node
 delivery is never load-bearing for them. The per-node cost is small (a 304
 poll or one SSE socket per node). PubSub fan-out remains for the one source
-class that inherently lands on a single node — webhooks — and those already
-carry `max_staleness` (Hole 3), so a lost broadcast heals within the bound.
+class that inherently lands on a single node — webhooks — and those never
+vouch (Hole 3), so every entry they feed carries its fallback TTL and a lost
+broadcast heals within that bound.
 A singleton-watcher-plus-broadcast architecture is explicitly rejected: it
 turns another node's health into this node's correctness.
 
@@ -327,8 +366,9 @@ best-effort. Postgres gets a truthful stream instead: the trigger +
 `LISTEN/NOTIFY` listener fires on commit regardless of write path, and
 `Postgrex.Notifications` monitors its connection — giving real
 `:down`/`:up` transitions that plug into Hole 2's rule. Qualification table:
-trigger+listener → full `:until_change`; notifier-only (SQLite, ETS, or
-Postgres without the trigger) → `max_staleness` bound.
+trigger+listener → vouches, full `:until_change`; notifier-only (SQLite,
+ETS, or Postgres without the trigger) → never vouches, entries keep the
+fallback TTL.
 
 ### Non-consistency note: invalidation stampedes (measured)
 
@@ -365,8 +405,8 @@ the Erlang SDK; if LaunchDarkly ever ships one, a watcher slots in).
   {:changed, [record.key]})`. Works on every data layer, covers AshAdmin and
   any app code, no configuration. Best-effort though (Hole 6): raw SQL and
   Ash's caller-managed-transaction caveat both skip it, so notifier-only
-  setups keep the `max_staleness` bound; only trigger + LISTEN/NOTIFY below
-  unlocks full `:until_change`.
+  setups never vouch and keep their fallback TTL; only trigger +
+  LISTEN/NOTIFY below unlocks the no-expiry path.
 * Multi-node comes free via the PubSub fan-out above.
 * Out-of-band SQL writes (Postgres): an optional
   `AshFeatureFlags.Provider.AshResource.Listener` watcher using
@@ -384,8 +424,9 @@ forward "/webhooks/flipt", AshFeatureFlags.Webhook.Flipt, secret: {:system, "FLI
 
 Verifies the HMAC signature, accepts `flag:*` audit events, maps
 namespace/flag key → `Changes.notify`. Webhooks carry no liveness signal
-(Hole 3), so `:until_change` for webhook-fed providers resolves to the
-configurable `max_staleness` bound (default ~10 minutes), never `:infinity`.
+(Hole 3), so they never vouch: entries keep the `{:until_change, fallback}`
+fallback TTL (set it generously here, e.g. `:timer.minutes(10)` — it is the
+safety net), and the webhook shrinks typical staleness to sub-second.
 The recommended setup pairs the webhook with the OFREP reconciliation poller
 against the same Flipt: webhook = sub-second latency, poller = bounded
 correctness.
@@ -397,9 +438,10 @@ context. `304` → nothing (and proves the source healthy). `200` (ETag moved)
 → **clear the whole source** — per-flag diffing is telemetry only, never the
 detector, because a rule change scoped away from the sentinel context leaves
 the sentinel's values unchanged (Hole 4). Whether the server's ETag hashes
-the *config* or the *evaluated results* is server-dependent, so poller-fed
-`:until_change` stays bounded by `max_staleness` unless the source is marked
-`trust_etag: true`. Reuses `AshFeatureFlags.HTTP`/`FakeHTTP`, no new deps.
+the *config* or the *evaluated results* is server-dependent, so by default
+the poller does not vouch — entries keep their fallback TTL — unless the
+source is marked `trust_etag: true`, which unlocks the no-expiry path.
+Reuses `AshFeatureFlags.HTTP`/`FakeHTTP`, no new deps.
 This covers flagd, GO Feature Flag, Unleash Edge and Flipt in one stroke.
 
 **OpenFeature in-process client** — when `client:` is set, attach an
@@ -430,7 +472,9 @@ dev setups behave.
    change is limited to the fence closing the existing race; ships alone.
 1. **Core plumbing** — `Changes` dispatcher (+ telemetry, PubSub, `on_change`
    hook), watcher supervision under `watch:`, health registry keyed by
-   source id, `ttl :until_change`, `default_ttl/1` callback (LaunchDarkly →
+   source id, `ttl {:until_change, fallback}` (bare `:until_change`
+   accepted, `{:until_change, :infinity}` rejected), `default_ttl/1`
+   callback (LaunchDarkly →
    0), Static and `AshResource.put/3` and `invalidate/1` routed through the
    dispatcher. Docs: new "Reacting to changes" README section replacing the
    bare `invalidate/1` advice.
@@ -450,9 +494,12 @@ dev setups behave.
   the dispatcher.
 * `FakeHTTP` grows ETag/304 support for the poller; webhook plug tested with
   `Plug.Test` and real HMACs.
-* `:until_change` needs an evaluator test matrix: stream up (no expiry),
-  stream down (fallback TTL), down-transition (entries dropped), *and*
-  up-transition after a gap (entries dropped — Hole 2).
+* `{:until_change, fallback}` needs an evaluator test matrix: source vouched
+  (no expiry), not vouched — down / webhook / untrusted ETag / no watcher at
+  all (entry gets the in-option fallback TTL), down-transition (entries
+  dropped), up-transition after a gap (entries dropped — Hole 2), and bare
+  `:until_change` resolving its fallback from the first numeric value further
+  down the chain.
 * Race regression tests from the probe that motivated the fence: an
   invalidation landing during a slow provider fun must not leave the stale
   result cached; `put/fetch` with `:infinity` must not raise; sweep must
