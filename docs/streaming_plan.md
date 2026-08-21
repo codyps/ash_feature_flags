@@ -128,8 +128,8 @@ explicit policies:
   that still get the streaming upside when the stream is healthy.
 * `{:until_change, :infinity}` — "event-driven invalidation only, no time
   backstop": entries never expire on their own; change events, explicit
-  `invalidate/1`, and `:down`/`:up` transitions remain the only things that
-  drop them. This is how many teams already run webhook-invalidated caches,
+  `invalidate/1`, and a reconciliation that finds the gap actually changed
+  something remain the only things that drop them. This is how many teams already run webhook-invalidated caches,
   and it is a legitimate trade — the operator accepts that a missed event
   means stale-until-the-next-event. It is an explicit opt-out of the
   consistency invariant's time backstop, in the same spirit as
@@ -148,7 +148,10 @@ Health is tracked per source id — the watcher registry is consulted at
 cache-write time. On a `:down` transition the dispatcher *demotes* exactly
 that source's entries (rewrites `:infinity` expiries to `now() + fallback`,
 serving last-known-good through what may be a correlated backend outage);
-on `:up` it clears the source so nothing from the gap survives. No other
+on reconnect it *reconciles* rather than clears — re-promoting entries in
+place when the gap changed nothing, atomically swapping or clearing only
+when it did (Hole 2's protocol; an eager clear would blip flags against a
+still-recovering backend). No other
 backend's entries are ever touched. `error_ttl` and
 the failures-not-cached rule are unchanged; `invalidate/1` keeps its public
 contract but routes through the dispatcher.
@@ -369,11 +372,12 @@ this design in two places:
   expiry is rewritten to `now() + fallback`, serving as last-known-good for
   one fallback window while lazy re-reads take over. (In-flight writes
   completing after the transition are still fenced and self-delete — they
-  were never vouched at insert.) On `:up` the source *is* cleared: the
-  server is reachable again, so re-reads are cheap and fresh, and clearing
-  is what guarantees nothing from the gap survives. The freshness ladder,
-  best to worst: vouched cache → fresh re-read → demoted last-known-good →
-  `on_error` strategy.
+  were never vouched at insert.) Reconnect is handled by the reconciliation
+  protocol in Hole 2 — re-promote in place when the gap provably changed
+  nothing, atomic swap or targeted clear when it did, and never an eager
+  clear that would blip flags against a still-recovering backend. The
+  freshness ladder, best to worst: vouched cache → fresh re-read → demoted
+  last-known-good → `on_error` strategy.
 * **Staleness should be observable, not silent.** Mirroring
   `PROVIDER_STALE`: evaluations served from demoted entries get
   `stale?: true` in the `:stop` telemetry metadata, and the dispatcher
@@ -433,18 +437,38 @@ conceivable provider round-trip (a minute is generous; the default
 ### Hole 2: events missed while a stream is down — including the reconnect gap
 
 A watcher that disconnects and reconnects has a window where events fired and
-nobody listened. Treating `:up` as "resume trusting the cache" silently keeps
-entries that predate the gap. Rule: **both transitions write the source's
-invalidation stamp; `:down` demotes the source's entries to the fallback TTL
-(serve last-known-good through what may be a correlated backend outage — see
-the vendor section), and `:up` clears the source** — the server is reachable
-again, re-reads are cheap and fresh, and state during the gap is unknown
-until re-observed. The stamp fence from Hole 1 covers the in-flight variant
-automatically (an evaluation started before either transition can't populate
-an unexpiring entry after it). Watchers that can cheaply resync on connect
-(the OFREP poller's first fetch, flagd's initial `SyncFlags` payload) get
-freshness back immediately; the clear-on-`:up` guarantees nothing stale
-survives the gap.
+nobody listened. Treating reconnect as "resume trusting the cache" silently
+keeps entries that predate the gap — but the naive fix, clearing the source
+on reconnect, **blips the flags**: it synchronizes a burst of re-reads at the
+exact moment the backend is most likely still shaky (server restarts are what
+cause reconnects), and any re-read that fails falls through `on_error` and
+flips its flag. Reconnect must be a *reconciliation*, never an eager clear:
+
+1. **Reconnect alone touches nothing.** The source's entries — demoted since
+   `:down` — keep serving. The source stays not-vouched.
+2. **The watcher reconciles across the gap** against the now-reachable
+   server: the OFREP poller compares the fresh ETag with the one from before
+   the disconnect; flagd's `SyncFlags` delivers a full snapshot on connect;
+   the LISTEN/NOTIFY listener re-fetches the rows it has cached.
+3. **Unchanged** → nothing was missed. The source's entries are re-promoted
+   in place (demoted expiries rewritten back to `:infinity`) and vouching
+   resumes. A brief connectivity blip costs *zero* cache disruption — no
+   drops, no re-reads, no value changes. This is the common case.
+4. **Changed** → ruleset-cached sources fetch the new state *first*, then
+   swap entries atomically, so there is never a window with nothing cached;
+   result-cached sources clear (the changed keys when the comparison names
+   them, else the source) — safe now, because the reconciliation call just
+   succeeded against that server, proving re-reads have somewhere to go.
+5. **Vouching resumes only when reconciliation completes** — in the health
+   registry, `:up` *means* "reconnected and reconciled", not "socket open".
+
+The stamp fence from Hole 1 covers the in-flight variant automatically (an
+evaluation started before the gap can't populate an unexpiring entry after
+the changed-branch clear). The residual exposure is a gap longer than the
+fallback TTL: demoted entries expire before reconnect and re-reads meet a
+possibly-down server — the case the deferred `on_error :stale` addresses,
+and the reason the fallback number is the operator's knob for how long an
+outage gets bridged.
 
 ### Hole 3: sources with no liveness signal (webhooks)
 
@@ -565,7 +589,10 @@ the Erlang SDK; if LaunchDarkly ever ships one, a watcher slots in).
   `AshFeatureFlags.Provider.AshResource.Listener` watcher using
   `Postgrex.Notifications`, plus a documented migration snippet
   (`AFTER INSERT OR UPDATE OR DELETE` trigger doing
-  `pg_notify('ash_feature_flags', key)`). Opt-in via `watch:`.
+  `pg_notify('ash_feature_flags', key)`). Opt-in via `watch:`. On listener
+  reconnect, reconciliation = re-fetch the rows this source has cached and
+  swap each in place (ruleset caching makes this cheap and atomic per flag —
+  no window where a flag has no rules, no blip).
 * SQLite: document as poll-only; the generic poller below can diff
   `max(updated_at)` if someone needs it.
 
@@ -594,6 +621,9 @@ the sentinel's values unchanged (Hole 4). Whether the server's ETag hashes
 the *config* or the *evaluated results* is server-dependent, so by default
 the poller does not vouch — entries keep their fallback TTL — unless the
 source is marked `trust_etag: true`, which unlocks the no-expiry path.
+Reconnect reconciliation (Hole 2) comes free here: the first poll after a
+gap carries the pre-disconnect ETag — a `304` proves nothing changed while
+we were blind, so entries are re-promoted in place and no flag blips.
 Reuses `AshFeatureFlags.HTTP`/`FakeHTTP`, no new deps.
 This covers flagd, GO Feature Flag, Unleash Edge and Flipt in one stroke.
 
@@ -628,7 +658,8 @@ dev setups behave.
    source id, `ttl {:until_change, fallback}` (bare `:until_change`
    accepted; `{:until_change, :infinity}` and plain `ttl :infinity`
    accepted as explicit event-driven-only policies), demote-on-`:down` /
-   clear-on-`:up` with `stale?: true` telemetry and
+   reconcile-on-reconnect (re-promote / swap / clear per Hole 2, never an
+   eager clear) with `stale?: true` telemetry and
    `[:ash_feature_flags, :source, :stale | :recovered]` events,
    `default_ttl/1` callback (LaunchDarkly → 0), Static and
    `AshResource.put/3` and `invalidate/1` routed through the dispatcher.
@@ -658,9 +689,12 @@ dev setups behave.
 * `{:until_change, fallback}` needs an evaluator test matrix: source vouched
   (no expiry), not vouched — down / webhook / untrusted ETag / no watcher at
   all (entry gets the in-option fallback TTL), down-transition (entries
-  demoted to the fallback TTL, `stale?: true` telemetry), up-transition
-  after a gap (entries dropped — Hole 2), `:infinity` fallback (entries
-  survive `:down` undemoted, still dropped on `:up` and on change events),
+  demoted to the fallback TTL, `stale?: true` telemetry), reconnect with
+  unchanged state (entries re-promoted in place — no drops, no re-reads, no
+  value blips), reconnect with changed state (atomic swap for ruleset
+  sources — never a window with nothing cached — and clear for result
+  sources), `:infinity` fallback (entries survive `:down` undemoted, still
+  replaced or dropped on reconciliation-with-change and on change events),
   and bare `:until_change` resolving its fallback from the first numeric
   value further down the chain.
 * Race regression tests from the probe that motivated the fence: an
