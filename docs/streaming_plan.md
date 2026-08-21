@@ -63,7 +63,13 @@ On `{:changed, keys}` it:
 
 PubSub subscription is symmetric: the dispatcher subscribes too, so a webhook
 landing on one node invalidates every node. Broadcast messages carry a node
-tag to avoid re-broadcast loops.
+tag to avoid re-broadcast loops. Two consistency-driven constraints (see the
+consistency section): PubSub delivery is best-effort, so it is only
+load-bearing for webhook sources, which are staleness-bounded anyway —
+polling/streaming watchers run per node. And the dispatcher is a single
+GenServer so that each source's `{:changed, ...}`/`:down`/`:up` events are
+applied in order, with invalidation stamps written before the corresponding
+deletes (the fence protocol).
 
 ### 2. Watchers — one process per change source
 
@@ -156,11 +162,13 @@ the provider's stream health, so `ttl_for` must take the resolved
 `:infinity | non_neg_integer()`. Local refactor, plus widened specs on
 `Cache.fetch/3` / `Cache.put/3`.
 
-Happily the cache storage format needs **no** change: Erlang term ordering
-puts every atom above every integer, so an `expires_at` of `:infinity`
-survives both the read check (`expires_at > now()`) and the sweeper's
-`{:<, :"$1", now()}` guard untouched. Phase 0 should pin that with a unit
-test rather than rely on it silently.
+The cache *storage and sweep* need no change: Erlang term ordering puts every
+atom above every integer, so an `expires_at` of `:infinity` survives both the
+read check (`expires_at > now()`) and the sweeper's `{:<, :"$1", now()}` guard
+— verified empirically against the real module. But `Cache.put/3` computes
+`now() + ttl` and **raises `ArithmeticError` on `:infinity`** (also verified),
+so `put/3` and `fetch/3` need an explicit `:infinity` clause. Phase 0 pins
+both with unit tests.
 
 ### 3. `child_spec/1` is the wrong hook for watchers — latent collision
 
@@ -210,6 +218,129 @@ Extend the contract to `%{status:, body:, headers:}` with readers using
 working unmodified. `HTTP.Req` and the test `FakeHTTP` grow header support
 (and a 304 fixture) in Phase 0/3.
 
+## Consistency: every way a change can be missed, and the invariant that stops it
+
+Invalidation-on-change trades the TTL's *bounded* staleness for *zero*
+staleness — but only if no change is ever missed. A missed change under
+`ttl :until_change` is **unbounded** staleness, which is strictly worse than
+today. So each hole below gets a closing mechanism, and they roll up into one
+invariant:
+
+> **A cache entry may outlive its TTL only while an actively health-checked
+> change stream vouches for it — and any doubt (disconnect, reconnect, gap,
+> unverifiable delivery) is resolved by dropping entries, never by keeping
+> them.**
+
+### Hole 1: the in-flight stale write (verified against the real code)
+
+`Cache.fetch/3` computes-then-puts. Sequence, reproduced with the actual
+module: entry cleared → request misses → provider HTTP call starts (reads
+*old* rules) → backend flips the flag → watcher fires `Cache.clear(key)` →
+the in-flight call returns and **writes the pre-change value after the
+invalidation ran**. Today a wrong value is pinned for one TTL; under
+`:until_change` it is pinned forever. This race needs no pathological timing —
+any change landing inside a provider round-trip triggers it, and changes are
+most likely exactly when people are toggling flags.
+
+Fix: an **invalidation-stamp fence** in `Cache`, Phase 0. A second ETS table
+records `last_invalidated_at` per flag key, per source, and globally, written
+with monotonic time *before* the corresponding `match_delete`. `fetch` notes
+`started_at` before invoking the provider fun; the subsequent put becomes
+"insert, then re-read the stamps, and self-delete if any stamp moved past
+`started_at`". Both interleavings converge: if the insert lands before the
+invalidator's delete, the delete removes it; if after, the stamp (written
+first) is already visible and the put self-deletes. No locks, no serialization
+of the hot read path. The fence applies to numeric TTLs too — it fixes a real
+(if smaller) bug that exists today.
+
+Validated with a prototype under an adversarial randomized schedule (provider
+read racing a mid-flight change + clear, 2000 runs): today's put-after-compute
+pinned the stale value in **670/2000** runs; the fence pinned it in **0/2000**.
+The stamp table stays tiny — one row per flag key ever invalidated, and a
+stamp only matters while a provider call that started before it is still in
+flight, so the existing sweep can prune stamps older than the longest
+conceivable provider round-trip (a minute is generous; the default
+`receive_timeout` is 2s).
+
+### Hole 2: events missed while a stream is down — including the reconnect gap
+
+A watcher that disconnects and reconnects has a window where events fired and
+nobody listened. Treating `:up` as "resume trusting the cache" silently keeps
+entries that predate the gap. Rule: **both `:down` and `:up` transitions write
+the source's invalidation stamp and clear the source** — state after a gap is
+unknown until re-observed. The stamp fence from Hole 1 covers the in-flight
+variant automatically (an evaluation started before the reconnect can't
+populate an `:until_change` entry after it). Watchers that can cheaply resync
+on connect (the OFREP poller's first fetch, flagd's initial `SyncFlags`
+payload) get freshness back immediately; the clear just guarantees nothing
+stale survives the gap.
+
+### Hole 3: sources with no liveness signal (webhooks)
+
+A webhook that never arrives is indistinguishable from no change: the app was
+deploying, the LB dropped it, the HMAC secret rotated, Flipt's sink queue
+overflowed. There is no `:down` to observe. Consequence, stated as a hard
+rule: **webhook-fed sources never qualify for unbounded `:until_change`** —
+they resolve it to the configurable `max_staleness` bound (default ~10 min).
+Better: pair the webhook with the OFREP reconciliation poller against the same
+backend — the webhook becomes a *latency optimization* (sub-second reaction)
+while the poller is the *correctness mechanism* (bounded, health-checked).
+Belt and suspenders, and each is simple alone.
+
+### Hole 4: the ETag poller's blind spot
+
+Diffing bulk-evaluation results under one sentinel context **cannot see every
+rule change**: a targeting change scoped to `role=admin` leaves a non-admin
+sentinel's values untouched. Two consequences:
+
+* Never use the per-flag diff as the *detector*. On any ETag change, clear
+  the whole source; the diff is only a log/telemetry nicety. Invalidation is
+  lazy re-evaluation, so over-clearing costs one provider round-trip per
+  actively-used flag+actor, not a stampede of wasted work.
+* Whether the ETag itself is computed over the *configuration* (catches
+  everything) or over the *evaluated results* (same blind spot as the diff)
+  is server-dependent and mostly undocumented. So by default, poller-fed
+  `:until_change` is **also bounded by `max_staleness`**, liftable per source
+  (`trust_etag: true`) when the operator knows their server hashes config —
+  flagd and GO Feature Flag can be verified and documented case by case.
+
+### Hole 5: cross-node divergence
+
+If one node's watcher detects a change and other nodes depend on a PubSub
+broadcast to hear about it, a netsplit or dropped message leaves those nodes
+pinned stale with no signal. Rule: **polling/streaming watchers run on every
+node** — each node's cache is guarded by its own watcher, and cross-node
+delivery is never load-bearing for them. The per-node cost is small (a 304
+poll or one SSE socket per node). PubSub fan-out remains for the one source
+class that inherently lands on a single node — webhooks — and those already
+carry `max_staleness` (Hole 3), so a lost broadcast heals within the bound.
+A singleton-watcher-plus-broadcast architecture is explicitly rejected: it
+turns another node's health into this node's correctness.
+
+### Hole 6: AshResource writes that never reach the notifier
+
+Ash notifications fire after commit, but two paths skip them: raw SQL /
+out-of-band writes, and the documented Ash caveat where writes inside a
+caller-managed transaction return notifications for the *caller* to send
+(the "missed notifications" warning). So the Ash-notifier stream is
+best-effort. Postgres gets a truthful stream instead: the trigger +
+`LISTEN/NOTIFY` listener fires on commit regardless of write path, and
+`Postgrex.Notifications` monitors its connection — giving real
+`:down`/`:up` transitions that plug into Hole 2's rule. Qualification table:
+trigger+listener → full `:until_change`; notifier-only (SQLite, ETS, or
+Postgres without the trigger) → `max_staleness` bound.
+
+### Non-consistency note: invalidation stampedes (measured)
+
+`Cache.fetch/3` has no single-flight: 50 concurrent readers of one cleared
+key produced 50 provider calls (measured). TTL expiry has the same behavior
+today, but a change event synchronizes the miss across *all* actors of a flag
+at once. Keys are per-actor, so per-key single-flight wouldn't dedupe anyway.
+Accept it for v1 (the burst is bounded by requests actually in flight),
+document it, and note `stale_while_revalidate` as a possible later mode —
+it deliberately reintroduces one round-trip of staleness, so it must stay
+opt-in.
+
 ### What does *not* need restructuring
 
 * The evaluator pipeline (role short-circuits → cache → provider → on_error)
@@ -232,7 +363,10 @@ the Erlang SDK; if LaunchDarkly ever ships one, a watcher slots in).
 * `AshFeatureFlags.FlagStore` auto-registers an `Ash.Notifier` on the flag
   resource: any create/update/destroy → `Changes.notify(:ash_resource,
   {:changed, [record.key]})`. Works on every data layer, covers AshAdmin and
-  any app code, no configuration.
+  any app code, no configuration. Best-effort though (Hole 6): raw SQL and
+  Ash's caller-managed-transaction caveat both skip it, so notifier-only
+  setups keep the `max_staleness` bound; only trigger + LISTEN/NOTIFY below
+  unlocks full `:until_change`.
 * Multi-node comes free via the PubSub fan-out above.
 * Out-of-band SQL writes (Postgres): an optional
   `AshFeatureFlags.Provider.AshResource.Listener` watcher using
@@ -249,21 +383,24 @@ forward "/webhooks/flipt", AshFeatureFlags.Webhook.Flipt, secret: {:system, "FLI
 ```
 
 Verifies the HMAC signature, accepts `flag:*` audit events, maps
-namespace/flag key → `Changes.notify`. Also document Flipt's OFREP endpoint as
-an alternative via the poller below. Webhooks don't carry stream health, so
-`:until_change` pairs with a long safety-net TTL rather than `:infinity` —
-resolve `:until_change` for webhook-fed providers to a configurable
-`max_staleness` (default e.g. 10 minutes).
+namespace/flag key → `Changes.notify`. Webhooks carry no liveness signal
+(Hole 3), so `:until_change` for webhook-fed providers resolves to the
+configurable `max_staleness` bound (default ~10 minutes), never `:infinity`.
+The recommended setup pairs the webhook with the OFREP reconciliation poller
+against the same Flipt: webhook = sub-second latency, poller = bounded
+correctness.
 
 **OpenFeature / OFREP** — `AshFeatureFlags.Provider.OpenFeature.Poller`
 watcher: `POST {base_url}/ofrep/v1/evaluate/flags` with `If-None-Match` on a
-configurable interval (default 15s). `304` → nothing (and proves the stream
-healthy). `200` → diff against the previous body per flag key, notify exactly
-the changed keys. Evaluated against a fixed sentinel context — any rule change
-shows up as *some* diff, and the reaction is key-level invalidation, so
-per-actor accuracy of the sentinel values is irrelevant. Reuses
-`AshFeatureFlags.HTTP`/`FakeHTTP`, no new deps. This covers flagd, GO Feature
-Flag, Unleash Edge and Flipt in one stroke.
+configurable interval (default 15s), evaluated under a fixed sentinel
+context. `304` → nothing (and proves the source healthy). `200` (ETag moved)
+→ **clear the whole source** — per-flag diffing is telemetry only, never the
+detector, because a rule change scoped away from the sentinel context leaves
+the sentinel's values unchanged (Hole 4). Whether the server's ETag hashes
+the *config* or the *evaluated results* is server-dependent, so poller-fed
+`:until_change` stays bounded by `max_staleness` unless the source is marked
+`trust_etag: true`. Reuses `AshFeatureFlags.HTTP`/`FakeHTTP`, no new deps.
+This covers flagd, GO Feature Flag, Unleash Edge and Flipt in one stroke.
 
 **OpenFeature in-process client** — when `client:` is set, attach an
 OpenFeature event handler for `PROVIDER_CONFIGURATION_CHANGED` and forward
@@ -284,10 +421,13 @@ dev setups behave.
 
 0. **Prerequisite restructuring** (see "Does the existing code need
    restructuring?") — `source_id/1` callback + cache key shape
-   `{source_id, flag_key, context_hash}` + `Cache.clear_source/1`;
-   provider-aware `ttl_for` with `:infinity` support (+ term-ordering unit
-   test); application tree split (Cache / Changes / WatcherSupervisor);
-   HTTP response headers. Pure refactor, no behaviour change, ships alone.
+   `{source_id, flag_key, context_hash}` + `Cache.clear_source/1`; the
+   invalidation-stamp fence in `Cache.fetch`/`clear` (Hole 1 — fixes a real
+   race that exists under numeric TTLs today); provider-aware `ttl_for` with
+   `:infinity` support in `put/3`/`fetch/3` (+ term-ordering and
+   `ArithmeticError` regression tests); application tree split
+   (Cache / Changes / WatcherSupervisor); HTTP response headers. Behaviour
+   change is limited to the fence closing the existing race; ships alone.
 1. **Core plumbing** — `Changes` dispatcher (+ telemetry, PubSub, `on_change`
    hook), watcher supervision under `watch:`, health registry keyed by
    source id, `ttl :until_change`, `default_ttl/1` callback (LaunchDarkly →
@@ -311,7 +451,14 @@ dev setups behave.
 * `FakeHTTP` grows ETag/304 support for the poller; webhook plug tested with
   `Plug.Test` and real HMACs.
 * `:until_change` needs an evaluator test matrix: stream up (no expiry),
-  stream down (fallback TTL), down-transition (entries dropped).
+  stream down (fallback TTL), down-transition (entries dropped), *and*
+  up-transition after a gap (entries dropped — Hole 2).
+* Race regression tests from the probe that motivated the fence: an
+  invalidation landing during a slow provider fun must not leave the stale
+  result cached; `put/fetch` with `:infinity` must not raise; sweep must
+  retain `:infinity` entries. (Probe script: five scenarios run against the
+  real `Cache` module confirmed the race, the `ArithmeticError`, sweep
+  behavior, source-id key matching, and the 50-caller stampede.)
 * Example app: `mix demo` gains a "flip a flag mid-run, watch the table
   change without a TTL wait" scenario per backend.
 
