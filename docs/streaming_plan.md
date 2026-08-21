@@ -46,13 +46,28 @@ Three small pieces, all additive:
 
 ### 1. `AshFeatureFlags.Changes` — the dispatcher
 
-One module every change source funnels into:
+One module every change source funnels into. Sources identify themselves by
+their **source id** (the same term that keys cache entries and the health
+registry — never a loose atom, or health and invalidation couldn't be
+connected back to entries), and the event vocabulary is closed and typed:
 
 ```elixir
-AshFeatureFlags.Changes.notify(:flipt, {:changed, ["new-checkout"]})
-AshFeatureFlags.Changes.notify(:flipt, {:changed, :all})   # snapshot changed, keys unknown
-AshFeatureFlags.Changes.notify(:flipt, :up | :down)        # stream health
+@type event ::
+        {:changed, [flag_key] | :all}            # rules changed; drop matching entries
+        | {:rules, flag_key, rules}              # ruleset sources: replace the row in place
+        | :down                                  # stream lost; demote this source's entries
+        | {:reconciled, :unchanged | event}      # gap verified; re-promote, or apply + clear
+
+AshFeatureFlags.Changes.notify(source_id, event)
 ```
+
+Note the asymmetry that fell out of the no-blip work: **there is no `:up`
+event.** A watcher can only report `:down` (observed) or `{:reconciled, _}`
+(proved) — "the socket opened again" is not a cache-relevant fact, and a
+source becomes vouched exclusively through a successful reconciliation.
+Initial connection is the same path: a watcher's first successful
+fetch/ETag/snapshot *is* its first reconciliation, so startup and reconnect
+share one code path and one test surface.
 
 On `{:changed, keys}` it:
 
@@ -71,7 +86,7 @@ tag to avoid re-broadcast loops. Two consistency-driven constraints (see the
 consistency section): PubSub delivery is best-effort, so it is only
 load-bearing for webhook sources, which are staleness-bounded anyway —
 polling/streaming watchers run per node. And the dispatcher is a single
-GenServer so that each source's `{:changed, ...}`/`:down`/`:up` events are
+GenServer so that each source's events (the typed set above) are
 applied in order, with invalidation stamps written before the corresponding
 deletes (the fence protocol).
 
@@ -86,8 +101,9 @@ A new optional provider callback:
 started by `AshFeatureFlags.Application` for providers listed under a new
 `config :ash_feature_flags, watch: [provider_refs]` (mirroring the existing
 `providers:`/`child_spec/1` mechanism, but explicit — watching is opt-in
-because it opens sockets/timers). Each watcher reports `:up`/`:down`/
-`{:changed, keys}` to `Changes`.
+because it opens sockets/timers). Each watcher derives its source id from its
+provider opts via `source_id/1` at start and reports the typed events above
+to `Changes`.
 
 ### 3. Cache semantics: `ttl {:until_change, fallback}`
 
@@ -469,11 +485,6 @@ demotion windows and clears. `{:until_change, :infinity}` is the explicit,
 LaunchDarkly-style opt-out for operators who prefer that trade — supported,
 documented, never the default.
 
-The remaining text of this section uses "drop" for the reconnect/gap cases
-(where re-reads are known-cheap) and demotion for `:down`, per the ladder
-above.
-> unverifiable delivery) is resolved by dropping entries, never by keeping
-> them.**
 
 ### Hole 1: the in-flight stale write (verified against the real code)
 
@@ -532,7 +543,8 @@ flips its flag. Reconnect must be a *reconciliation*, never an eager clear:
    them, else the source) — safe now, because the reconciliation call just
    succeeded against that server, proving re-reads have somewhere to go.
 5. **Vouching resumes only when reconciliation completes** — in the health
-   registry, `:up` *means* "reconnected and reconciled", not "socket open".
+   registry a source becomes vouched only through `{:reconciled, _}` —
+   there is no `:up` event, and "socket open" is not a cache-relevant fact.
 
 The stamp fence from Hole 1 covers the in-flight variant automatically (an
 evaluation started before the gap can't populate an unexpiring entry after
@@ -643,8 +655,8 @@ the Erlang SDK; if LaunchDarkly ever ships one, a watcher slots in).
   evaluation runs locally from it, and per-actor result entries disappear
   for this source.
 * `AshFeatureFlags.FlagStore` auto-registers an `Ash.Notifier` on the flag
-  resource: any create/update/destroy → `Changes.notify(:ash_resource,
-  {:changed_rules, record})` — the notification *carries the new row*, so
+  resource: any create/update/destroy → `Changes.notify(source_id,
+  {:rules, record.key, record})` — the notification *carries the new row*, so
   the dispatcher replaces the cached ruleset in place: zero re-read, true
   push. Works on every data layer, covers AshAdmin and
   any app code, no configuration. Best-effort though (Hole 6): raw SQL and
@@ -714,6 +726,85 @@ release.
 `Cache.clear` directly, so tests exercise the same pipeline and multi-node
 dev setups behave.
 
+## The freshness contract
+
+Everything above condenses into guarantees an application developer can rely
+on without reading this document. These are the sentences that go at the top
+of the README section:
+
+1. **A flag value only ever changes for one of three reasons:** the rules
+   changed in the backend, the actor changed (role, tenant, attributes), or
+   last-known-good expired during an outage and `on_error` took over.
+   Infrastructure events alone — stream reconnects, node restarts, deploys of
+   the flag backend, cache sweeps — never move a flag.
+2. **How fast a rule change lands** depends on the source, worst-case:
+   vouched stream / local writes → the event latency (ms); ETag poller →
+   its interval (default 15s); webhook → delivery latency when it arrives,
+   the fallback TTL when it doesn't; no watcher → the numeric TTL, exactly
+   today's behaviour.
+3. **Within one flag, a change cuts over consistently:** one invalidation
+   (or row swap) moves every actor on that node together; deterministic
+   bucketing means raising a rollout never turns a user off and no user ever
+   flickers.
+4. **Across flags, no ordering is promised.** Two flags flipped "together"
+   in the backend may be observed in either order for a moment (separate
+   events, separate entries). A pair of gates that must move atomically
+   should be one flag — use a variant if it has more than two states.
+5. **Across nodes, convergence is bounded** by each node's own watcher
+   latency (watchers run per node); nodes never depend on each other to
+   learn about a change, so skew is small and self-healing.
+
+## API surface and defaults at a glance
+
+Everything this plan adds or changes, in one place.
+
+**DSL / config values** (each at flag → resource → app level):
+
+| Option | Values | Default |
+| --- | --- | --- |
+| `ttl` / `cache_ttl` | `ms`, `0`, `:infinity`, `:until_change`, `{:until_change, ms \| 0 \| :infinity}` | `5_000`, unchanged |
+| `watch:` (app) | provider refs to start watchers for | `[]` — no watchers |
+| `pubsub:` (app) | a Phoenix.PubSub name | off |
+| `on_change:` (app) | `{module, fun}` hook | off |
+| poller `interval:` | ms between OFREP polls | `15_000` |
+| poller `trust_etag:` | ETag counts as vouching | `false` |
+
+**Public functions:** `AshFeatureFlags.invalidate/0,1` (unchanged contract,
+now routed through the dispatcher so it broadcasts and shows in telemetry);
+new `AshFeatureFlags.source_status/1` → `:vouched | :stale | :unwatched`
+for health checks and dashboards. `AshFeatureFlags.Webhook.Flipt` as a
+mountable plug. Everything else is configuration, not API.
+
+**Provider behaviour additions (all optional, all with behaviour-preserving
+defaults):** `source_id/1` (identity term; default = full `{module, opts}`),
+`change_stream/1` (watcher child spec; default = no watcher),
+`default_ttl/1` (provider-recommended TTL consulted after flag/resource/app
+config; only LaunchDarkly implements it, returning `0`), and the ruleset
+pair `fetch_rules/2` + `local_evaluate/3` — where `local_evaluate` must
+yield both the boolean *and* the variant from cached rules (AshResource's
+row carries `variant`), so its result is
+`{:ok, boolean() | {boolean(), String.t() | nil}}`.
+
+**Telemetry:** existing `[:ash_feature_flags, :evaluate, *]` unchanged, with
+`stale?: true` added to `:stop` metadata for demoted serves; new
+`[:ash_feature_flags, :change]` and `[:ash_feature_flags, :source,
+:stale | :recovered]`.
+
+**Out-of-the-box behaviour changes** (everything not listed here is
+byte-identical):
+
+* The invalidation-stamp fence closes the measured stale-write race — under
+  numeric TTLs too. Strictly a bug fix; values can only get *more* correct.
+* LaunchDarkly stops result-caching when no ttl is configured anywhere
+  (provider `default_ttl` `0` beats only the built-in `5_000`, never an
+  explicit value). Effect: rule changes land immediately instead of ≤5s
+  late, at the cost of an in-process ETS lookup per evaluation. An explicit
+  `cache_ttl` anywhere restores the old behaviour. Called out in the
+  changelog.
+* AshResource switches to ruleset caching: identical values, same default
+  freshness, but one row read per flag per window instead of one per
+  flag × actor — strictly fewer DB reads.
+
 ## Phases
 
 0. **Prerequisite restructuring** (see "Does the existing code need
@@ -733,6 +824,7 @@ dev setups behave.
    reconcile-on-reconnect (re-promote / swap / clear per Hole 2, never an
    eager clear) with `stale?: true` telemetry and
    `[:ash_feature_flags, :source, :stale | :recovered]` events,
+   `AshFeatureFlags.source_status/1`,
    `default_ttl/1` callback (LaunchDarkly → 0), Static and
    `AshResource.put/3` and `invalidate/1` routed through the dispatcher.
    Docs: new "Reacting to changes" README section replacing the bare
@@ -783,5 +875,8 @@ dev setups behave.
 * Pushing evaluated *values* to callers (contextual evaluation makes
   invalidation the correct primitive; see above).
 * A gRPC dependency in the core package.
-* Changing default behaviour: with no `watch:` config and numeric TTLs,
-  nothing observable changes.
+* Broad default-behaviour changes: with no `watch:` config, the only
+  out-of-the-box differences are the three listed in "API surface and
+  defaults at a glance" (the race fix, LaunchDarkly's `default_ttl 0`, and
+  AshResource's ruleset cache) — each value-preserving or strictly
+  correcting.
