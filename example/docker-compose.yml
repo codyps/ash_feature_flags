@@ -1,0 +1,83 @@
+# Two flag backends and one Postgres, all seeded from files in ./docker so the
+# demo starts from a known state.
+#
+#     docker compose up -d
+#     mix demo
+#
+# The Postgres service is only needed if you follow the "SQLite or Postgres"
+# section of the README and swap the repo over; the demo uses SQLite by default
+# and needs nothing running.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Flipt — https://flipt.io
+  #
+  # Reads its whole flag state from ./docker/flipt/features.yml at boot
+  # ("declarative" / local storage), so there is no database to migrate and no
+  # clicking through a UI before the demo works. The UI at http://localhost:8080
+  # is read-only in this mode — edit the file and restart to change a flag.
+  # ---------------------------------------------------------------------------
+  flipt:
+    image: docker.flipt.io/flipt/flipt:v1.54.0
+    ports:
+      - "8080:8080"
+    environment:
+      FLIPT_STORAGE_TYPE: local
+      FLIPT_STORAGE_LOCAL_PATH: /var/opt/flipt/state
+      FLIPT_LOG_LEVEL: warn
+      # Auth is off so the demo needs no token. To try the token path, turn
+      # this on and pass `token:` to the provider — see README.
+      FLIPT_AUTHENTICATION_REQUIRED: "false"
+    volumes:
+      - ./docker/flipt:/var/opt/flipt/state:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # flagd — https://flagd.dev, the OpenFeature reference flag daemon.
+  #
+  # Speaks OFREP (the OpenFeature Remote Evaluation Protocol) on :8016, which is
+  # what AshFeatureFlags.Provider.OpenFeature talks to. Any other OFREP server
+  # — GO Feature Flag, Flipt's own OFREP endpoint — drops in here unchanged.
+  # ---------------------------------------------------------------------------
+  flagd:
+    image: ghcr.io/open-feature/flagd:v0.16.2
+    command:
+      - start
+      - --uri
+      - file:/etc/flagd/flags.json
+      - --ofrep-port
+      - "8016"
+      - --log-format
+      - console
+    ports:
+      - "8013:8013" # gRPC / flag evaluation
+      - "8016:8016" # OFREP over HTTP — the one we use
+    volumes:
+      - ./docker/flagd:/etc/flagd:ro
+
+  # ---------------------------------------------------------------------------
+  # Postgres — for running the database provider against Postgres instead of
+  # the default SQLite. See "SQLite or Postgres" in the README.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: example_app_dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

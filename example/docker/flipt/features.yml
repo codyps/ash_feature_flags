@@ -1,0 +1,74 @@
+# Flipt declarative state.
+#
+# The same five flags the other backends carry, expressed in Flipt's idiom:
+# `enabled` is the default answer for a boolean flag, and `rollouts` are
+# ordered rules evaluated before it.
+#
+# The evaluation request AshFeatureFlags sends looks like:
+#
+#   POST /evaluate/v1/boolean
+#   {
+#     "namespaceKey": "default",
+#     "flagKey": "fraud-tooling",
+#     "entityId": "user?id=8e2b...",     <- stable per actor, drives % rollouts
+#     "context": {"roles": "support", "tenant": "", "resource": "...", ...}
+#   }
+#
+# ...so every key in `context` is available to segment constraints below.
+version: "1.4"
+namespace: default
+
+segments:
+  - key: support-staff
+    name: Support staff
+    description: Actors whose roles include "support"
+    match_type: ALL_MATCH_TYPE
+    constraints:
+      # AshFeatureFlags sends roles as a comma-joined string. Flipt v1 has no
+      # substring operator (only eq/neq/prefix/suffix/isoneof/isnotoneof/
+      # empty/notempty), so this matches the exact string. The example app
+      # gives each user a single `role`, so "support" is the whole value; add
+      # the other combinations to `isoneof` if your actors carry several roles.
+      - type: STRING_COMPARISON_TYPE
+        property: roles
+        operator: eq
+        value: support
+
+flags:
+  - key: express-checkout
+    name: Express checkout
+    description: One-tap checkout. On for everyone.
+    type: BOOLEAN_FLAG_TYPE
+    enabled: true
+
+  - key: gift-wrapping
+    name: Gift wrapping
+    description: Off for everyone. Admins still get it, via enabled_for_roles in the resource.
+    type: BOOLEAN_FLAG_TYPE
+    enabled: false
+
+  - key: ml-scoring
+    name: ML scoring
+    description: Hides the predicted_ltv attribute while off.
+    type: BOOLEAN_FLAG_TYPE
+    enabled: false
+
+  - key: fraud-tooling
+    name: Fraud tooling
+    description: Reveals fraud_notes, but only to support.
+    type: BOOLEAN_FLAG_TYPE
+    enabled: false
+    rollouts:
+      - segment:
+          key: support-staff
+          value: true
+
+  - key: loyalty-pricing
+    name: Loyalty pricing
+    description: 50% rollout, bucketed by entityId.
+    type: BOOLEAN_FLAG_TYPE
+    enabled: false
+    rollouts:
+      - threshold:
+          percentage: 50
+          value: true

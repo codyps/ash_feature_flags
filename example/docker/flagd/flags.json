@@ -1,0 +1,54 @@
+{
+  "$schema": "https://flagd.dev/schema/v0/flags.json",
+  "_comment": [
+    "flagd state, seeded at boot. The same five flags as every other backend.",
+    "",
+    "AshFeatureFlags talks OFREP:",
+    "  POST /ofrep/v1/evaluate/flags/fraud-tooling",
+    "  {\"context\": {\"targetingKey\": \"user?id=8e2b...\", \"roles\": \"support\", ...}}",
+    "",
+    "so `targetingKey` and every other context key can be referenced from the",
+    "JsonLogic `targeting` rules below."
+  ],
+  "flags": {
+    "express-checkout": {
+      "state": "ENABLED",
+      "variants": { "on": true, "off": false },
+      "defaultVariant": "on"
+    },
+
+    "gift-wrapping": {
+      "state": "ENABLED",
+      "variants": { "on": true, "off": false },
+      "defaultVariant": "off"
+    },
+
+    "ml-scoring": {
+      "state": "ENABLED",
+      "variants": { "on": true, "off": false },
+      "defaultVariant": "off"
+    },
+
+    "fraud-tooling": {
+      "state": "ENABLED",
+      "variants": { "on": true, "off": false },
+      "defaultVariant": "off",
+      "targeting": {
+        "if": [{ "in": ["support", { "var": "roles" }] }, "on", "off"]
+      }
+    },
+
+    "loyalty-pricing": {
+      "state": "ENABLED",
+      "variants": { "on": true, "off": false },
+      "defaultVariant": "off",
+      "targeting": {
+        "fractional": [
+          { "var": "targetingKey" },
+          ["on", 50],
+          ["off", 50]
+        ]
+      }
+    }
+  }
+}

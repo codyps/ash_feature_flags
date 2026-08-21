@@ -1,0 +1,6 @@
+/_build/
+/deps/
+/priv/*.db
+/priv/*.db-*
+erl_crash.dump
+*.ez
