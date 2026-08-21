@@ -217,6 +217,24 @@ semantics, and the code already implements them.
 Rollouts are where per-actor answers, caching, and rule changes intersect, so
 the interaction deserves explicit statement.
 
+**Topology: the rollout population is the app's end clients, never its server
+instances.** The chain is flag backend → AshFeatureFlags (inside each app
+node) → end users: a 20% rollout means 20% of the *actors* (bucketed on the
+end user's targeting key — the `ash_authentication` subject or primary key),
+and the server instance contributes nothing to the hash. Every node therefore
+computes the identical answer for the same user — for AshResource because
+`:erlang.phash2` is documented portable across architectures and ERTS
+versions, for Flipt/OFREP/LaunchDarkly because the bucketing runs against the
+same key wherever it executes. N app servers never split a rollout N ways
+and never disagree with each other. Where evaluation *executes* varies by
+provider (the flag server for Flipt/OFREP, the vendor SDK in-process for
+LaunchDarkly, this library for AshResource/Static — plus the DSL's
+role short-circuits, which always run here) — but correctness never depends
+on centralizing it, only on every evaluator hashing the same
+`{flag_key, targeting_key}`. AshFeatureFlags is itself a *client* of the
+flag backend, not a flag server: it does not re-serve flag state to
+browsers or mobile apps, and nothing in this plan changes that.
+
 **Steady state: caching is transparent to rollouts.** Every backend buckets
 deterministically on `{flag_key, targeting_key}` — AshResource's
 `phash2({key, targeting_key}, 100) < pct`, Flipt hashing `entityId`
