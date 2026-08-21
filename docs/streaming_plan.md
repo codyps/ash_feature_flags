@@ -84,13 +84,140 @@ because it opens sockets/timers). Each watcher reports `:up`/`:down`/
 A new TTL value at every level (flag `ttl`, resource `cache_ttl`, app
 `cache_ttl`): entries are written without expiry **while the flag's provider
 has a healthy change stream**, and the evaluator falls back to the normal
-numeric TTL chain when the stream is `:down` (watcher registry consulted at
-write time; on a `:down` transition the dispatcher clears that source's
-entries so nothing is pinned stale across an outage). `invalidate/1`,
-`error_ttl` and the failures-not-cached rule are unchanged.
+numeric TTL chain when the stream is `:down`. Health is tracked per *source
+id* (see the restructuring section) — the watcher registry is consulted at
+cache-write time, and on a `:down` transition the dispatcher calls
+`Cache.clear_source/1` for exactly that source, so nothing is pinned stale
+across an outage and no other backend's entries are touched. `error_ttl` and
+the failures-not-cached rule are unchanged; `invalidate/1` keeps its public
+contract but routes through the dispatcher.
 
 This is the payoff piece: stream healthy → zero re-reads, instant changes;
 stream broken → today's behaviour, automatically.
+
+## Does the existing code need restructuring?
+
+Reviewed with watchers in mind. The dispatcher/watcher layer is genuinely
+additive — no rewrite of the evaluator or cache is needed — but five things in
+the current code either block the design or would be fought against later.
+The first is a real prerequisite; the rest are small and best done in the same
+pass (Phase 0 below).
+
+### 1. There is no "source identity" — the enabling refactor
+
+Cache keys are `{phash2(provider_ref), flag_key, context_hash}` where
+`provider_ref` is the **fully merged** `{module, opts}` computed per
+evaluation by `Evaluator.provider_for/3` (flag → opts → resource → app
+config). Watchers, by contrast, are configured statically. Nothing connects
+"the watcher for Flipt namespace `billing` went down" to "these cache entries
+came from Flipt namespace `billing`":
+
+* `:until_change` health gating needs *per-source* clearing on a `:down`
+  transition; today the only correct reaction would be `Cache.clear/0` —
+  every source pays for one source's outage.
+* The evaluator needs to ask "is the stream for *this flag's* provider
+  healthy?" at cache-write time, and there is no stable term to key that
+  lookup on: the merged ref differs per flag/resource even when it is the
+  same backend.
+* Incidentally, hashing the *entire* opts into the key means non-semantic
+  options (`receive_timeout`, `retry`) fragment the cache today.
+
+Fix: a new optional provider callback
+
+```elixir
+@callback source_id(keyword()) :: term()
+```
+
+returning a compact identity term — the options that select *which backend
+answers*, nothing else. Flipt: `{Flipt, base_url, namespace, reference}`;
+OpenFeature: `{OpenFeature, base_url, path_prefix}` (or `{:client, client}`);
+LaunchDarkly: `{LaunchDarkly, instance}`; AshResource: `{AshResource,
+resource, tenant}`; default when not exported: `{module, opts}` in full, which
+preserves today's behaviour exactly. The cache key becomes
+`{source_id, flag_key, context_hash}` (stored literally — small and
+debuggable), giving:
+
+* `Cache.clear/1` unchanged — its match pattern `{{:_, key, :_}, ...}`
+  doesn't care what the first element is.
+* A new `Cache.clear_source(source_id)` via the same `match_delete`.
+* Health registry and watcher registration keyed by `source_id`; the
+  evaluator resolves flag → provider ref → `source_id` → health, all terms it
+  already has in hand.
+
+This must land before any watcher does, or `:until_change` degrades to
+"clear the world on any hiccup".
+
+### 2. TTL resolution is provider-blind
+
+`Evaluator.ttl_for/3` is a pure config lookup returning an integer, resolved
+independently of `provider_for/3`. `:until_change` makes TTL a function of
+the provider's stream health, so `ttl_for` must take the resolved
+`{provider, opts}` (available at both call sites already) and return
+`:infinity | non_neg_integer()`. Local refactor, plus widened specs on
+`Cache.fetch/3` / `Cache.put/3`.
+
+Happily the cache storage format needs **no** change: Erlang term ordering
+puts every atom above every integer, so an `expires_at` of `:infinity`
+survives both the read check (`expires_at > now()`) and the sweeper's
+`{:<, :"$1", now()}` guard untouched. Phase 0 should pin that with a unit
+test rather than rely on it silently.
+
+### 3. `child_spec/1` is the wrong hook for watchers — latent collision
+
+`Application.provider_children/0` starts anything under `providers:` that
+exports `child_spec/1`. But `use GenServer` *auto-generates* `child_spec/1`,
+so the first provider implemented as a GenServer would be silently started as
+its own "poller" by that mechanism. No current provider trips this, but the
+watcher work multiplies GenServers. Keep `child_spec/1` for what it is (SDK
+clients), add the distinct `change_stream/1` callback for watchers under the
+separate `watch:` key, and implement watchers as their own modules
+(`Provider.OpenFeature.Poller`), never on the provider module itself.
+
+### 4. Invalidation call sites bypass any future dispatcher
+
+`Static.put/reset`, `AshResource.put/3` and the public
+`AshFeatureFlags.invalidate/1` all call `Cache.clear` directly. Once
+`Changes` exists they must route through it, or provider-initiated writes
+won't broadcast across nodes and won't show up in change telemetry.
+Semantics: `Cache.clear` stays the node-local primitive; `Changes.notify`
+= clear + telemetry + PubSub; `invalidate/1` re-points at `Changes` (that is
+what someone hand-wiring a webhook wants).
+
+### 5. `Cache.init/1` owns unrelated state
+
+The cache GenServer owns the cache table, the sweep timer, *and* Static's
+override table. With a dispatcher, a health registry and a watcher supervisor
+arriving, restructure the application tree explicitly:
+
+```
+AshFeatureFlags.Supervisor
+├── AshFeatureFlags.Cache            # cache table + sweep only
+├── AshFeatureFlags.Changes          # dispatcher + health registry (+ Static's table)
+├── provider children (providers:)   # unchanged
+└── AshFeatureFlags.WatcherSupervisor (watch:)
+```
+
+Watchers under their own supervisor so a crash-looping poller can hit its
+restart limit without taking the cache down; `Changes` starts before watchers
+so there is always somewhere to report to.
+
+### Also required, easily missed: HTTP response headers
+
+The `AshFeatureFlags.HTTP` behaviour's response type is
+`%{status:, body:}` — no headers, so the OFREP poller cannot read `ETag`.
+Extend the contract to `%{status:, body:, headers:}` with readers using
+`Map.get(resp, :headers, [])`, so existing custom `http_client:` stubs keep
+working unmodified. `HTTP.Req` and the test `FakeHTTP` grow header support
+(and a 304 fixture) in Phase 0/3.
+
+### What does *not* need restructuring
+
+* The evaluator pipeline (role short-circuits → cache → provider → on_error)
+  is untouched; watchers never sit in the request path.
+* The `Provider` behaviour stays backward compatible — `source_id/1` and
+  `change_stream/1` are optional with behaviour-preserving defaults.
+* `Cache.clear/1`'s key-matching design already anticipated this feature; it
+  keeps working across the key-shape change.
 
 ## Per-backend work
 
@@ -155,11 +282,18 @@ dev setups behave.
 
 ## Phases
 
+0. **Prerequisite restructuring** (see "Does the existing code need
+   restructuring?") — `source_id/1` callback + cache key shape
+   `{source_id, flag_key, context_hash}` + `Cache.clear_source/1`;
+   provider-aware `ttl_for` with `:infinity` support (+ term-ordering unit
+   test); application tree split (Cache / Changes / WatcherSupervisor);
+   HTTP response headers. Pure refactor, no behaviour change, ships alone.
 1. **Core plumbing** — `Changes` dispatcher (+ telemetry, PubSub, `on_change`
-   hook), watcher supervision under `watch:`, health registry,
-   `ttl :until_change`, `default_ttl/1` callback (LaunchDarkly → 0), Static
-   routed through the dispatcher. Docs: new "Reacting to changes" README
-   section replacing the bare `invalidate/1` advice.
+   hook), watcher supervision under `watch:`, health registry keyed by
+   source id, `ttl :until_change`, `default_ttl/1` callback (LaunchDarkly →
+   0), Static and `AshResource.put/3` and `invalidate/1` routed through the
+   dispatcher. Docs: new "Reacting to changes" README section replacing the
+   bare `invalidate/1` advice.
 2. **AshResource** — FlagStore `Ash.Notifier`; PubSub fan-out test with two
    sandboxed dispatcher instances; Postgres LISTEN/NOTIFY watcher + migration
    docs.
