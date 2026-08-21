@@ -71,7 +71,9 @@ share one code path and one test surface.
 
 On `{:changed, keys}` it:
 
-* calls `Cache.clear/1` per key (or `clear/0` for `:all`)
+* calls `Cache.clear/1` per key — and for `:all`, `Cache.clear_source/1`
+  scoped to the reporting source, never a global `clear/0`: "my snapshot
+  changed, keys unknown" says nothing about other backends' entries
 * emits telemetry `[:ash_feature_flags, :change]` with `%{source:, keys:}`
 * broadcasts on Phoenix.PubSub when configured
   (`config :ash_feature_flags, pubsub: MyApp.PubSub` — optional dep, resolved
@@ -87,8 +89,10 @@ consistency section): PubSub delivery is best-effort, so it is only
 load-bearing for webhook sources, which are staleness-bounded anyway —
 polling/streaming watchers run per node. And the dispatcher is a single
 GenServer so that each source's events (the typed set above) are
-applied in order, with invalidation stamps written before the corresponding
-deletes (the fence protocol).
+applied in order. The invalidation stamps themselves live in the fenced
+`Cache` primitives (`clear/1`, `clear_source/1` write their stamp before
+deleting), so every clear is fenced no matter who calls it — the dispatcher
+adds ordering, not the fence.
 
 ### 2. Watchers — one process per change source
 
@@ -151,9 +155,12 @@ explicit policies:
   consistency invariant's time backstop, in the same spirit as
   `on_error :enable`: never a default, always something you typed. The docs
   spell out the failure mode, and it composes sensibly — on a vouching
-  source it changes nothing (vouched entries are already unexpiring, and
-  down/up transitions still clear); its real meaning is on webhook-only
-  sources.
+  source it changes little (vouched entries are already unexpiring; a
+  `:down` demotion to an `:infinity` fallback is a no-op, and
+  reconciliation-with-change still clears); its real meaning is on
+  webhook-only sources. One boundary: "never expire" is about *freshness* —
+  residency eviction (`idle_ttl`, section 4) still applies, harmlessly,
+  since an evicted-idle entry re-reads to the same value.
 
 For symmetry, plain `ttl :infinity` (no tuple) is also accepted once the
 cache handles atom expiries: "cache until told otherwise", which makes the
@@ -161,9 +168,17 @@ README's existing manual-`invalidate/1`-from-your-own-webhook workflow
 first-class instead of requiring a large magic number.
 
 Health is tracked per source id — the watcher registry is consulted at
-cache-write time. On a `:down` transition the dispatcher *demotes* exactly
-that source's entries (rewrites `:infinity` expiries to `now() + fallback`,
-serving last-known-good through what may be a correlated backend outage);
+cache-write time, and each entry carries a small state tag:
+**`:vouched` | `:demoted` | `:numeric`**. The tag is what makes three other
+mechanisms well-defined: demotion flips exactly the `:vouched` entries to
+`:demoted` (a plain `ttl 5_000` entry from the same source is `:numeric` and
+untouched), re-promotion after an unchanged-gap reconciliation restores
+exactly the `:demoted` ones (it could otherwise wrongly grant `:infinity` to
+policy-numeric entries), and `stale?: true` telemetry is simply "served from
+a `:demoted` entry". On a `:down` transition the dispatcher *demotes*
+that source's vouched entries (rewrites `:infinity` expiries to
+`now() + fallback`, serving last-known-good through what may be a correlated
+backend outage);
 on reconnect it *reconciles* rather than clears — re-promoting entries in
 place when the gap changed nothing, atomically swapping or clearing only
 when it did (Hole 2's protocol; an eager clear would blip flags against a
@@ -589,10 +604,11 @@ flips its flag. Reconnect must be a *reconciliation*, never an eager clear:
    server: the OFREP poller compares the fresh ETag with the one from before
    the disconnect; flagd's `SyncFlags` delivers a full snapshot on connect;
    the LISTEN/NOTIFY listener re-fetches the rows it has cached.
-3. **Unchanged** → nothing was missed. The source's entries are re-promoted
-   in place (demoted expiries rewritten back to `:infinity`) and vouching
-   resumes. A brief connectivity blip costs *zero* cache disruption — no
-   drops, no re-reads, no value changes. This is the common case.
+3. **Unchanged** → nothing was missed. The source's `:demoted` entries are
+   re-promoted in place (expiries restored to `:infinity`; entries tagged
+   `:numeric` are policy-numeric and stay untouched) and vouching resumes.
+   A brief connectivity blip costs *zero* cache disruption — no drops, no
+   re-reads, no value changes. This is the common case.
 4. **Changed** → ruleset-cached sources fetch the new state *first*, then
    swap entries atomically, so there is never a window with nothing cached;
    result-cached sources clear (the changed keys when the comparison names
@@ -667,8 +683,9 @@ caller-managed transaction return notifications for the *caller* to send
 (the "missed notifications" warning). So the Ash-notifier stream is
 best-effort. Postgres gets a truthful stream instead: the trigger +
 `LISTEN/NOTIFY` listener fires on commit regardless of write path, and
-`Postgrex.Notifications` monitors its connection — giving real
-`:down`/`:up` transitions that plug into Hole 2's rule. Qualification table:
+`Postgrex.Notifications` monitors its connection — giving a real `:down`
+signal and a natural reconciliation step (re-fetch cached rows) that plug
+into Hole 2's protocol. Qualification table:
 trigger+listener → vouches, full `:until_change`; notifier-only (SQLite,
 ETS, or Postgres without the trigger) → never vouches, entries keep the
 fallback TTL.
@@ -790,7 +807,8 @@ of the README section:
 
 1. **A flag value only ever changes for one of three reasons:** the rules
    changed in the backend, the actor changed (role, tenant, attributes), or
-   last-known-good expired during an outage and `on_error` took over.
+   the provider failed with nothing cached to serve and `on_error` took
+   over.
    Infrastructure events alone — stream reconnects, node restarts, deploys of
    the flag backend, cache sweeps — never move a flag.
 2. **How fast a rule change lands** depends on the source, worst-case:
