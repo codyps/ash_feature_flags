@@ -117,16 +117,35 @@ As a tuple, both halves of the policy travel together through the one
 existing chain. A bare `:until_change` is still accepted and takes its
 fallback from the first *numeric* value further down the chain (else the
 5s default) — conservative, and webhook users who want long-lived entries
-are told to write the tuple explicitly. `{:until_change, 0}` expresses
-"cache only while vouched" — kill-switch semantics that still get the
-streaming upside. `{:until_change, :infinity}` is rejected: unbounded
-lifetime without vouching violates the invariant in the consistency
-section.
+are told to write the tuple explicitly. The two extremes are both valid,
+explicit policies:
+
+* `{:until_change, 0}` — "cache only while vouched": kill-switch semantics
+  that still get the streaming upside when the stream is healthy.
+* `{:until_change, :infinity}` — "event-driven invalidation only, no time
+  backstop": entries never expire on their own; change events, explicit
+  `invalidate/1`, and `:down`/`:up` transitions remain the only things that
+  drop them. This is how many teams already run webhook-invalidated caches,
+  and it is a legitimate trade — the operator accepts that a missed event
+  means stale-until-the-next-event. It is an explicit opt-out of the
+  consistency invariant's time backstop, in the same spirit as
+  `on_error :enable`: never a default, always something you typed. The docs
+  spell out the failure mode, and it composes sensibly — on a vouching
+  source it changes nothing (vouched entries are already unexpiring, and
+  down/up transitions still clear); its real meaning is on webhook-only
+  sources.
+
+For symmetry, plain `ttl :infinity` (no tuple) is also accepted once the
+cache handles atom expiries: "cache until told otherwise", which makes the
+README's existing manual-`invalidate/1`-from-your-own-webhook workflow
+first-class instead of requiring a large magic number.
 
 Health is tracked per source id — the watcher registry is consulted at
-cache-write time, and on a `:down` transition the dispatcher calls
-`Cache.clear_source/1` for exactly that source, so nothing is pinned stale
-across an outage and no other backend's entries are touched. `error_ttl` and
+cache-write time. On a `:down` transition the dispatcher *demotes* exactly
+that source's entries (rewrites `:infinity` expiries to `now() + fallback`,
+serving last-known-good through what may be a correlated backend outage);
+on `:up` it clears the source so nothing from the gap survives. No other
+backend's entries are ever touched. `error_ttl` and
 the failures-not-cached rule are unchanged; `invalidate/1` keeps its public
 contract but routes through the dispatcher.
 
@@ -150,9 +169,9 @@ config). Watchers, by contrast, are configured statically. Nothing connects
 "the watcher for Flipt namespace `billing` went down" to "these cache entries
 came from Flipt namespace `billing`":
 
-* `:until_change` health gating needs *per-source* clearing on a `:down`
-  transition; today the only correct reaction would be `Cache.clear/0` —
-  every source pays for one source's outage.
+* `:until_change` health gating needs *per-source* demotion/clearing on
+  `:down`/`:up` transitions; today the only correct reaction would be
+  `Cache.clear/0` — every source pays for one source's outage.
 * The evaluator needs to ask "is the stream for *this flag's* provider
   healthy?" at cache-write time, and there is no stable term to key that
   lookup on: the merged ref differs per flag/resource even when it is the
@@ -258,8 +277,68 @@ staleness — but only if no change is ever missed. A missed change under
 today. So each hole below gets a closing mechanism, and they roll up into one
 invariant:
 
-> **A cache entry may outlive its TTL only while an actively health-checked
-> change stream vouches for it — and any doubt (disconnect, reconnect, gap,
+> **A cache entry may outlive its numeric TTL only while an actively
+> health-checked change stream vouches for it — any doubt (disconnect,
+> reconnect, gap, unverifiable delivery) bounds the entry's remaining
+> lifetime or drops it. Unbounded lifetime without vouching exists only
+> where the operator explicitly wrote `:infinity`.**
+
+### What the flag vendors themselves do
+
+The design should be checked against how the services handle the same
+problem in their own SDKs, and the industry posture is consistent:
+**serve stale and signal, never drop.** LaunchDarkly's in-memory feature
+store has *no TTL at all* — on stream loss the SDK serves last-known-good
+indefinitely and resyncs on reconnect (a cache TTL knob exists only for
+persistent stores). The OpenFeature spec standardizes the same idea:
+providers emit `PROVIDER_STALE` and mark evaluations with reason `STALE`,
+but evaluation keeps serving cached data — only `FATAL`/`NOT_READY` fall
+back to defaults. flagd's provider spec goes STALE → `retryGracePeriod` →
+ERROR while still evaluating from the last ruleset.
+
+One architectural difference explains where we can afford to differ: those
+SDKs cache the *ruleset* — dropping it leaves nothing to evaluate with, so
+every gate would flip to its default, and serving stale is obviously the
+lesser evil. Our cache holds *evaluated results* while the authoritative
+server stays independently queryable — dropping an entry usually just costs
+one cheap re-read of *fresh* truth. But the vendor posture still corrects
+this design in two places:
+
+* **`:down` must demote, not delete.** Stream loss frequently correlates
+  with the backend itself being down; clearing the source at that moment
+  forces re-reads that fail into `on_error` fallbacks — flipping flags
+  during an outage, exactly the failure LaunchDarkly's serve-stale posture
+  avoids. So on `:down`, existing entries are *demoted*: their `:infinity`
+  expiry is rewritten to `now() + fallback`, serving as last-known-good for
+  one fallback window while lazy re-reads take over. (In-flight writes
+  completing after the transition are still fenced and self-delete — they
+  were never vouched at insert.) On `:up` the source *is* cleared: the
+  server is reachable again, so re-reads are cheap and fresh, and clearing
+  is what guarantees nothing from the gap survives. The freshness ladder,
+  best to worst: vouched cache → fresh re-read → demoted last-known-good →
+  `on_error` strategy.
+* **Staleness should be observable, not silent.** Mirroring
+  `PROVIDER_STALE`: evaluations served from demoted entries get
+  `stale?: true` in the `:stop` telemetry metadata, and the dispatcher
+  emits `[:ash_feature_flags, :source, :stale | :recovered]` alongside the
+  existing change events.
+
+It also motivates an `on_error :stale` strategy as a follow-up (RFC 5861
+"stale-if-error" semantics): on provider failure, serve the previous cached
+value — even one past its expiry, within a bounded grace window — before
+resorting to `:default`/`:disable`/`:enable`. That is deferred (it changes
+sweep retention), but the ladder above leaves a natural slot for it.
+
+The invariant survives contact with the vendors because the missed-change
+holes below are about *silently unbounded* staleness. The vendors bound
+theirs with health signals and resync-on-reconnect; we bound ours with
+demotion windows and clears. `{:until_change, :infinity}` is the explicit,
+LaunchDarkly-style opt-out for operators who prefer that trade — supported,
+documented, never the default.
+
+The remaining text of this section uses "drop" for the reconnect/gap cases
+(where re-reads are known-cheap) and demotion for `:down`, per the ladder
+above.
 > unverifiable delivery) is resolved by dropping entries, never by keeping
 > them.**
 
@@ -298,14 +377,17 @@ conceivable provider round-trip (a minute is generous; the default
 
 A watcher that disconnects and reconnects has a window where events fired and
 nobody listened. Treating `:up` as "resume trusting the cache" silently keeps
-entries that predate the gap. Rule: **both `:down` and `:up` transitions write
-the source's invalidation stamp and clear the source** — state after a gap is
-unknown until re-observed. The stamp fence from Hole 1 covers the in-flight
-variant automatically (an evaluation started before the reconnect can't
-populate an `:until_change` entry after it). Watchers that can cheaply resync
-on connect (the OFREP poller's first fetch, flagd's initial `SyncFlags`
-payload) get freshness back immediately; the clear just guarantees nothing
-stale survives the gap.
+entries that predate the gap. Rule: **both transitions write the source's
+invalidation stamp; `:down` demotes the source's entries to the fallback TTL
+(serve last-known-good through what may be a correlated backend outage — see
+the vendor section), and `:up` clears the source** — the server is reachable
+again, re-reads are cheap and fresh, and state during the gap is unknown
+until re-observed. The stamp fence from Hole 1 covers the in-flight variant
+automatically (an evaluation started before either transition can't populate
+an unexpiring entry after it). Watchers that can cheaply resync on connect
+(the OFREP poller's first fetch, flagd's initial `SyncFlags` payload) get
+freshness back immediately; the clear-on-`:up` guarantees nothing stale
+survives the gap.
 
 ### Hole 3: sources with no liveness signal (webhooks)
 
@@ -473,11 +555,16 @@ dev setups behave.
 1. **Core plumbing** — `Changes` dispatcher (+ telemetry, PubSub, `on_change`
    hook), watcher supervision under `watch:`, health registry keyed by
    source id, `ttl {:until_change, fallback}` (bare `:until_change`
-   accepted, `{:until_change, :infinity}` rejected), `default_ttl/1`
-   callback (LaunchDarkly →
-   0), Static and `AshResource.put/3` and `invalidate/1` routed through the
-   dispatcher. Docs: new "Reacting to changes" README section replacing the
-   bare `invalidate/1` advice.
+   accepted; `{:until_change, :infinity}` and plain `ttl :infinity`
+   accepted as explicit event-driven-only policies), demote-on-`:down` /
+   clear-on-`:up` with `stale?: true` telemetry and
+   `[:ash_feature_flags, :source, :stale | :recovered]` events,
+   `default_ttl/1` callback (LaunchDarkly → 0), Static and
+   `AshResource.put/3` and `invalidate/1` routed through the dispatcher.
+   Docs: new "Reacting to changes" README section replacing the bare
+   `invalidate/1` advice. (`on_error :stale` — serve expired last-known-good
+   on provider failure, RFC 5861 style — is sketched in the vendor section
+   and deferred to a later phase.)
 2. **AshResource** — FlagStore `Ash.Notifier`; PubSub fan-out test with two
    sandboxed dispatcher instances; Postgres LISTEN/NOTIFY watcher + migration
    docs.
@@ -497,9 +584,11 @@ dev setups behave.
 * `{:until_change, fallback}` needs an evaluator test matrix: source vouched
   (no expiry), not vouched — down / webhook / untrusted ETag / no watcher at
   all (entry gets the in-option fallback TTL), down-transition (entries
-  dropped), up-transition after a gap (entries dropped — Hole 2), and bare
-  `:until_change` resolving its fallback from the first numeric value further
-  down the chain.
+  demoted to the fallback TTL, `stale?: true` telemetry), up-transition
+  after a gap (entries dropped — Hole 2), `:infinity` fallback (entries
+  survive `:down` undemoted, still dropped on `:up` and on change events),
+  and bare `:until_change` resolving its fallback from the first numeric
+  value further down the chain.
 * Race regression tests from the probe that motivated the fence: an
   invalidation landing during a slow provider fun must not leave the stale
   result cached; `put/fetch` with `:infinity` must not raise; sweep must
