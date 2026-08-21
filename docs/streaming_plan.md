@@ -23,6 +23,10 @@ exactly that (it match-deletes boolean and variant entries across all context
 hashes), so the streaming layer is a set of *change sources* feeding one
 dispatcher, not a new cache.
 
+This constraint binds only where evaluation is *remote*. Providers whose
+rules can be fetched and evaluated locally escape it — see "Rulesets vs
+results" below, which upgrades AshResource to rules-push.
+
 ## What each backend actually supports
 
 | Backend | Push mechanism | Verdict |
@@ -151,6 +155,59 @@ contract but routes through the dispatcher.
 
 This is the payoff piece: stream healthy → zero re-reads, instant changes;
 stream broken, missing, or untrusted → the fallback TTL, automatically.
+
+## Rulesets vs results: which layer should the cache hold?
+
+The vendor SDKs cache the *ruleset* (the flag's configuration) and evaluate
+locally per call; our cache holds evaluated *results* per flag × actor. Should
+we switch? Per provider the answer differs sharply, so the design becomes
+**layer-aware** rather than either/or:
+
+| Provider | Verdict | Why |
+| --- | --- | --- |
+| **AshResource** | **Switch to ruleset caching** | The rules already live in one row and `evaluate/3` already runs locally in Elixir — today we fetch the row per actor per TTL window and memoize per-actor booleans, the worst of both layers. |
+| **Static** | Already is one | The override table + config map *is* a locally evaluated ruleset; the result cache on top is pointless (tests run `ttl 0` anyway). |
+| **LaunchDarkly** | Already handled | The SDK ruleset-caches beneath us; `default_ttl → 0` removes the redundant result cache. |
+| **Flipt / generic OFREP** | **Keep result caching** | OFREP is remote-evaluation *by design* — there is no rules-fetch endpoint to cache from. Flipt v1's config API exists, but evaluating it locally means porting Flipt's engine (bucketing hash, constraint operators) and tracking upstream drift — the reason no Elixir flipt-client exists. |
+| **flagd gRPC sync / Flipt v2 snapshots** | The deferred phases *are* the ruleset path | Those streams deliver rulesets; adopting them later means embedding the respective evaluation engines. Deferred on the same grounds as before. |
+
+### What the AshResource switch buys
+
+Mechanically: the evaluator gains a second, optional provider path —
+`fetch_rules(flag, opts)` + `local_evaluate(rules, flag, context)` — and for
+providers exporting it, the cache stores the rules keyed
+`{source_id, flag_key, :rules}` (same table; the existing `clear/1` and
+`clear_source/1` match patterns cover it) while per-actor result entries
+disappear for that source. Per-actor answers are recomputed per call from the
+cached row: a `phash2` bucket and a role-list check, nanoseconds. The wins
+compound:
+
+* **One entry per flag** instead of per flag × actor × context-hash — and the
+  invalidation stampede for this source vanishes: 50 concurrent actors after
+  a change share one row fetch (single-flight per flag becomes feasible
+  *and* worthwhile now that the key is shared; per-actor keys made it
+  useless before).
+* **True value push, not just invalidation.** The `Ash.Notifier` on the
+  FlagStore delivers the changed record itself — the watcher can write the
+  new row straight into the rules cache. The change-stream primitive for
+  this source upgrades from "drop and lazily re-read" to "replace in place",
+  with zero re-read; the fence still guards the racing fetch path.
+* **The consistency posture matches the vendors'** exactly where their logic
+  applies: a demoted/stale rules row still answers *every* actor
+  deterministically during an outage, which is precisely the serve-stale
+  behaviour LaunchDarkly's store exhibits.
+* The top-of-document constraint ("streams can only signal rule changes, so
+  invalidation is the primitive") stays true for remote-evaluation
+  providers — but dissolves for providers whose rules are local. The
+  design's primitive is per source: rules-push where the layer allows,
+  invalidation where it doesn't.
+
+The cost is honest but small: two cache shapes in one library. Contained by
+sharing everything else — same ETS table, same source ids, same
+stamps/fence, same health and demotion machinery — with the provider
+callback choosing the path. For AshResource there is no semantic-drift risk
+(unlike porting a vendor engine): *we* define the row's evaluation
+semantics, and the code already implements them.
 
 ## Does the existing code need restructuring?
 
@@ -457,11 +514,14 @@ fallback TTL.
 `Cache.fetch/3` has no single-flight: 50 concurrent readers of one cleared
 key produced 50 provider calls (measured). TTL expiry has the same behavior
 today, but a change event synchronizes the miss across *all* actors of a flag
-at once. Keys are per-actor, so per-key single-flight wouldn't dedupe anyway.
-Accept it for v1 (the burst is bounded by requests actually in flight),
-document it, and note `stale_while_revalidate` as a possible later mode —
-it deliberately reintroduces one round-trip of staleness, so it must stay
-opt-in.
+at once. For result-cached (remote-evaluation) sources, keys are per-actor,
+so per-key single-flight wouldn't dedupe anyway: accept it for v1 (the burst
+is bounded by requests actually in flight), document it, and note
+`stale_while_revalidate` as a possible later mode — it deliberately
+reintroduces one round-trip of staleness, so it must stay opt-in. For
+ruleset-cached sources (see "Rulesets vs results") the problem disappears:
+the key is shared per flag, one fetch serves every actor, and single-flight
+on it is cheap to add.
 
 ### What does *not* need restructuring
 
@@ -482,14 +542,25 @@ TTL still wins. Document why `:until_change` doesn't apply (no listener API in
 the Erlang SDK; if LaunchDarkly ever ships one, a watcher slots in).
 
 **AshResource** —
+* Converted to **ruleset caching** (see "Rulesets vs results"): the cache
+  holds the flag's row per `{source_id, flag_key, :rules}`, per-actor
+  evaluation runs locally from it, and per-actor result entries disappear
+  for this source.
 * `AshFeatureFlags.FlagStore` auto-registers an `Ash.Notifier` on the flag
   resource: any create/update/destroy → `Changes.notify(:ash_resource,
-  {:changed, [record.key]})`. Works on every data layer, covers AshAdmin and
+  {:changed_rules, record})` — the notification *carries the new row*, so
+  the dispatcher replaces the cached ruleset in place: zero re-read, true
+  push. Works on every data layer, covers AshAdmin and
   any app code, no configuration. Best-effort though (Hole 6): raw SQL and
   Ash's caller-managed-transaction caveat both skip it, so notifier-only
   setups never vouch and keep their fallback TTL; only trigger +
   LISTEN/NOTIFY below unlocks the no-expiry path.
-* Multi-node comes free via the PubSub fan-out above.
+* Multi-node comes free via the PubSub fan-out above — but cross-node
+  messages stay *invalidation-only* (`{:changed, keys}`), never rows: a
+  broadcast struct could cross code versions mid-rolling-deploy. In-place
+  row replacement is a node-local optimization; other nodes lazily re-read
+  one row, and nodes with the LISTEN/NOTIFY watcher hear about it directly
+  anyway.
 * Out-of-band SQL writes (Postgres): an optional
   `AshFeatureFlags.Provider.AshResource.Listener` watcher using
   `Postgrex.Notifications`, plus a documented migration snippet
@@ -565,9 +636,12 @@ dev setups behave.
    `invalidate/1` advice. (`on_error :stale` — serve expired last-known-good
    on provider failure, RFC 5861 style — is sketched in the vendor section
    and deferred to a later phase.)
-2. **AshResource** — FlagStore `Ash.Notifier`; PubSub fan-out test with two
-   sandboxed dispatcher instances; Postgres LISTEN/NOTIFY watcher + migration
-   docs.
+2. **AshResource** — convert to ruleset caching (`fetch_rules/2` +
+   `local_evaluate/3` provider path, rules keyed `{source_id, flag_key,
+   :rules}`, per-actor entries dropped for this source); FlagStore
+   `Ash.Notifier` writes changed rows straight into the rules cache;
+   PubSub fan-out test with two sandboxed dispatcher instances; Postgres
+   LISTEN/NOTIFY watcher + migration docs.
 3. **OFREP poller** — ETag/diff watcher against `FakeHTTP`; wire the example
    app's flagd demo to it.
 4. **Flipt webhook plug** — HMAC verification, event filtering, example app
