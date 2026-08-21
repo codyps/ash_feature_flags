@@ -175,6 +175,62 @@ contract but routes through the dispatcher.
 This is the payoff piece: stream healthy → zero re-reads, instant changes;
 stream broken, missing, or untrusted → the fallback TTL, automatically.
 
+### 4. Residency: bounding cache size once entries stop expiring
+
+`:until_change` creates a problem the TTL cache never had: vouched and
+`:infinity` entries are never swept, so the result cache grows to
+*flags × every actor ever evaluated* per node, unbounded. (It also makes
+`:down` demotion scans proportionally expensive.) The fix rests on a split
+the new design makes possible: entry lifetime used to mean *freshness*; with
+freshness now governed by events and fallbacks, lifetime is free to become
+**residency** — how long an entry earns its memory — and evicting for
+residency is always value-safe (an evicted entry lazily re-reads to the same
+answer unless the rules actually changed).
+
+This is well-trodden ground. "TTL reset by reads" is a first-class named
+feature everywhere: Caffeine's `expireAfterAccess`, Ehcache's `timeToIdle`,
+.NET's `SlidingExpiration` — the standard tool for activity-bound entries
+like ours, with the standard caveat (a constantly-read entry never idles
+out) being *exactly the property we want*, since freshness is enforced
+elsewhere. The gold-standard caches pair it with a size cap as the primary
+bound (Caffeine's `maximumSize`, Redis's `maxmemory-policy allkeys-lru`).
+But per-entry LRU or per-read expiry bumps turn every cache *read* into an
+ETS *write* — hot-key contention on the exact path the cache exists to keep
+cheap, and the reason strict LRU is famously awkward on the BEAM. The
+BEAM-idiomatic answer, and the one Nebulex's local adapter ships as its
+core design, is **generational eviction**, which delivers both requests at
+once:
+
+* The cache becomes two ETS generations. Reads check the new generation,
+  then the old; a hit in the old generation *promotes* the entry (copies it
+  forward) — that promotion is the "reset by read", costing one write per
+  entry per generation instead of one per read.
+* Every `idle_ttl` (default `:timer.hours(1)`, `:infinity` disables) the
+  generations rotate: the old table — holding exactly the entries not read
+  since the last rotation — is deleted *wholesale*, O(1), no scan.
+* An optional `max_entries` cap triggers early rotation when the new
+  generation exceeds it: an approximate-LRU size bound (memory ≈ 2× cap,
+  least-recently-used entries evicted first) without any per-read
+  bookkeeping.
+
+Memory becomes "actors active in the last `idle_ttl` × flags" — the natural
+working set — and an idle user returning pays one provider re-read.
+
+Correctness interactions, both already solved by existing machinery:
+
+* **Promotion is a put and goes through the fence.** A promotion racing a
+  concurrent invalidation could otherwise resurrect a just-deleted entry —
+  the same shape as Hole 1 — so promote re-checks the stamps with the read's
+  start time, and clears/demotes/swaps apply to both generations.
+* **Reads extend residency, never freshness.** The freshness deadline
+  (fallback expiry, demotion bound) travels with the entry unchanged on
+  promotion; the effective deadline is always `min(freshness, residency)`.
+  A demoted entry can never outlive its fallback window by being read.
+
+Rules rows need no special-casing: a flag being evaluated at all keeps its
+row promoted, and a row idling out just means nobody asked — one row
+re-fetch when they do.
+
 ## Rulesets vs results: which layer should the cache hold?
 
 The vendor SDKs cache the *ruleset* (the flag's configuration) and evaluate
@@ -768,6 +824,8 @@ Everything this plan adds or changes, in one place.
 | `on_change:` (app) | `{module, fun}` hook | off |
 | poller `interval:` | ms between OFREP polls | `15_000` |
 | poller `trust_etag:` | ETag counts as vouching | `false` |
+| `idle_ttl:` (app) | generation rotation period — entries unread for this long are evicted (residency, not freshness) | `:timer.hours(1)`; `:infinity` disables |
+| `max_entries:` (app) | early-rotation size cap (approximate LRU, memory ≈ 2× cap) | off |
 
 **Public functions:** `AshFeatureFlags.invalidate/0,1` (unchanged contract,
 now routed through the dispatcher so it broadcasts and shows in telemetry);
@@ -804,6 +862,9 @@ byte-identical):
 * AshResource switches to ruleset caching: identical values, same default
   freshness, but one row read per flag per window instead of one per
   flag × actor — strictly fewer DB reads.
+* Idle eviction at the default `idle_ttl` of one hour: observable only for
+  numeric TTLs *longer* than an hour (rare), where an entry unread for an
+  hour now costs a re-read on the next access — values unchanged.
 
 ## Phases
 
@@ -824,7 +885,8 @@ byte-identical):
    reconcile-on-reconnect (re-promote / swap / clear per Hole 2, never an
    eager clear) with `stale?: true` telemetry and
    `[:ash_feature_flags, :source, :stale | :recovered]` events,
-   `AshFeatureFlags.source_status/1`,
+   `AshFeatureFlags.source_status/1`, generational residency (`idle_ttl`
+   rotation with fence-checked promotion, optional `max_entries`),
    `default_ttl/1` callback (LaunchDarkly → 0), Static and
    `AshResource.put/3` and `invalidate/1` routed through the dispatcher.
    Docs: new "Reacting to changes" README section replacing the bare
@@ -861,6 +923,10 @@ byte-identical):
   replaced or dropped on reconciliation-with-change and on change events),
   and bare `:until_change` resolving its fallback from the first numeric
   value further down the chain.
+* Residency tests: an entry read across a rotation survives (promotion), an
+  unread entry is gone after two rotations, promotion racing an invalidation
+  does not resurrect the entry (fence), a demoted entry's freshness deadline
+  is not extended by reads, and `max_entries` triggers early rotation.
 * Race regression tests from the probe that motivated the fence: an
   invalidation landing during a slow provider fun must not leave the stale
   result cached; `put/fetch` with `:infinity` must not raise; sweep must
@@ -874,6 +940,9 @@ byte-identical):
 
 * Pushing evaluated *values* to callers (contextual evaluation makes
   invalidation the correct primitive; see above).
+* Strict LRU with per-read bookkeeping: every read becoming an ETS write is
+  hot-key contention on the path the cache exists to protect; generational
+  rotation gives the approximate equivalent for free.
 * A gRPC dependency in the core package.
 * Broad default-behaviour changes: with no `watch:` config, the only
   out-of-the-box differences are the three listed in "API surface and
